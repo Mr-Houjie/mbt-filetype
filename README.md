@@ -6,7 +6,7 @@
 
 ## 特性
 
-- **104 条魔数签名，96 种类型**：图片、文档、归档、音视频、可执行、字体、数据库、科学数据、WASM、数据列存
+- **104 条魔数签名，124 种类型**：图片、文档、归档、音视频、可执行、字体、数据库、科学数据、WASM、数据列存
 - **容器消歧**：ZIP → docx / xlsx / pptx / epub / apk / jar / odt / ods / odp / xps；RIFF → wav / avi / webp；ftyp → mp4 / mov / heic / avif / m4a / 3gp；EBML → mkv / webm；IFF → aiff；Ogg → opus；OLE2 → doc / xls / ppt 候选；ASF → wma / wmv 候选
 - **不猜原则**：证据不足时返回 `unknown`，歧义时返回候选列表，绝不返回一个错误答案
 - **可解释**：输出命中的签名、偏移、字节数与判定理由

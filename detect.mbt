@@ -692,12 +692,53 @@ pub fn signature_count() -> Int {
 }
 
 ///|
+/// 由容器消歧推导出的类型：它们没有独立签名，但确实是可识别的已知类型。
+fn container_types() -> Array[FileType] {
+  [
+    doc,
+    xls,
+    ppt,
+    docx,
+    xlsx,
+    pptx,
+    odt,
+    ods,
+    odp,
+    xps,
+    apk,
+    jar,
+    wav,
+    aiff,
+    opus,
+    m4a,
+    wma,
+    mp4,
+    mov,
+    mkv,
+    webm,
+    avi,
+    wmv,
+    threegp,
+    webp,
+    avif,
+    heic,
+    macho,
+    java_class,
+  ]
+}
+
+///|
 /// 全部已知类型（按首次出现顺序去重），用于 `--list-types`。
 pub fn known_types() -> Array[FileType] {
   let out : Array[FileType] = []
   for sig in signatures {
     if !contains_type(out, sig.file_type.id) {
       out.push(sig.file_type)
+    }
+  }
+  for file_type in container_types() {
+    if !contains_type(out, file_type.id) {
+      out.push(file_type)
     }
   }
   for file_type in text_types {

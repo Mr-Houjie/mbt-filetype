@@ -12,7 +12,7 @@
 它只读文件内容头部，不依赖扩展名，把「这段字节是什么文件」变成**可解释、可测试、可放进 CI**
 的工程能力，为 MoonBit 生态补齐 libmagic 级别的类型识别基础设施。
 
-**架构分为五层**：类型模型（types）→ 有序签名表（signatures，104 条签名 / 96 种类型）→
+**架构分为五层**：类型模型（types）→ 有序签名表（signatures，104 条签名 / 124 种类型）→
 检测引擎（detect：魔数匹配 → 容器消歧 → 文本启发式）→ 输出渲染（render：text / json / 类型清单）→
 应用层（cmd/main 与 cmd/verify）。
 
@@ -33,7 +33,7 @@
 
 ## 四、核心功能
 
-1. **104 条魔数签名、96 种类型**：图片、文档、归档、音视频、可执行、字体、数据库、科学数据、WASM、数据列存
+1. **104 条魔数签名、124 种类型**：图片、文档、归档、音视频、可执行、字体、数据库、科学数据、WASM、数据列存
 2. **容器消歧**：ZIP → docx/xlsx/pptx/epub/apk/jar/odt/ods/odp/xps；RIFF → wav/avi/webp；
    ftyp → mp4/mov/heic/avif/m4a/3gp；EBML → mkv/webm；IFF → aiff；Ogg → opus；OLE2 / ASF 返回候选
 3. **不猜原则**：弱签名只给 `probable`；证据不足返回 `unknown` 或候选列表，绝不返回错误答案
