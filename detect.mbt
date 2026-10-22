@@ -1,321 +1,437 @@
 // 检测引擎。
 //
 // 整体流程：
-//   1. 按签名表顺序做魔数匹配（强签名在前，弱签名在后）；
-//   2. 命中通用容器后做一次消歧（ZIP / RIFF / ftyp / OLE2 / CAFEBABE / TTF）；
-//   3. 没有命中签名时，做保守的文本启发式；
-//   4. 仍然无法判断则返回 unknown，并保留证据说明。
+//   1. 用户规则（Registry）；
+//   2. 按签名表顺序做魔数匹配（强签名在前，弱签名在后）；
+//   3. 命中容器类签名后交给结构解析层判定（ZIP 中央目录 / OLE2 目录流 /
+//      ISO-BMFF box / RIFF chunk / EBML DocType / PE 头）；
+//   4. 命中弱签名时做结构校验，校验失败则回落；
+//   5. 用户检测器；
+//   6. 保守的文本启发式；
+//   7. 仍然无法判断则返回 unknown。
 //
+// 置信度由证据累加得出（见 `confidence_of_score`），不是人工标注的标签。
 // 所有字节访问都先做边界检查，因此任意输入都不会触发越界。
 
+// ---------------------------------------------------------------------------
+// 证据与结果构造
+// ---------------------------------------------------------------------------
+
 ///|
-/// 在 `offset` 处比对 `magic`，越界或长度不足返回 `false`。
-fn match_at(data : Bytes, offset : Int, magic : Bytes) -> Bool {
-  let n = data.length()
-  let m = magic.length()
-  if offset < 0 || m == 0 || offset + m > n {
-    return false
-  }
-  let mut i = 0
-  while i < m {
-    if data[offset + i].to_int() != magic[i].to_int() {
-      return false
-    }
-    i = i + 1
-  }
-  true
+const W_STRONG : Int = 90
+const W_WEAK : Int = 20
+const W_STRUCTURE : Int = 40
+const W_DECISIVE : Int = 70
+const W_HEURISTIC : Int = 30
+
+///|
+fn evidence(
+  kind : String,
+  label : String,
+  offset : Int,
+  matched_len : Int,
+  weight : Int,
+) -> Evidence {
+  { kind, label, offset, matched_len, weight }
 }
 
 ///|
-/// 在 `data` 的前 `limit` 个字节内搜索字节串。
-fn contains_bytes(data : Bytes, pattern : Bytes, limit : Int) -> Bool {
-  let end = if data.length() < limit { data.length() } else { limit }
-  let m = pattern.length()
-  if m == 0 || end < m {
-    return false
+fn make_detection(
+  file_type : FileType?,
+  reason : String,
+  evidence : Array[Evidence],
+  candidates : Array[FileType],
+) -> Detection {
+  let mut score = 0
+  for item in evidence {
+    score = score + item.weight
   }
-  let mut i = 0
-  while i + m <= end {
-    if match_at(data, i, pattern) {
-      return true
-    }
-    i = i + 1
+  if score > 100 {
+    score = 100
   }
-  false
-}
-
-///|
-/// 读取大端 16 位整数。
-fn u16_be(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 2 > data.length() {
-    return None
-  }
-  Some(data[offset].to_int() * 256 + data[offset + 1].to_int())
-}
-
-///|
-/// 读取大端 32 位整数。
-fn u32_be(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 4 > data.length() {
-    return None
-  }
-  Some(
-    data[offset].to_int() * 16777216 +
-    data[offset + 1].to_int() * 65536 +
-    data[offset + 2].to_int() * 256 +
-    data[offset + 3].to_int(),
-  )
-}
-
-///|
-/// 读取小端 32 位整数。
-fn u32_le(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 4 > data.length() {
-    return None
-  }
-  Some(
-    data[offset + 3].to_int() * 16777216 +
-    data[offset + 2].to_int() * 65536 +
-    data[offset + 1].to_int() * 256 +
-    data[offset].to_int(),
-  )
-}
-
-///|
-fn ascii_lower_byte(b : Int) -> Int {
-  if b >= 65 && b <= 90 {
-    b + 32
+  let offset = if evidence.length() > 0 { evidence[0].offset } else { 0 }
+  let matched_len = if evidence.length() > 0 {
+    evidence[0].matched_len
   } else {
-    b
+    0
   }
-}
-
-///|
-/// 大小写不敏感的前缀比较（仅 ASCII）。
-fn starts_with_ci(data : Bytes, pattern : Bytes) -> Bool {
-  if data.length() < pattern.length() {
-    return false
+  let confidence = match file_type {
+    Some(_) => confidence_of_score(score)
+    None => Unknown
   }
-  let mut i = 0
-  while i < pattern.length() {
-    if ascii_lower_byte(data[i].to_int()) !=
-      ascii_lower_byte(pattern[i].to_int()) {
-      return false
-    }
-    i = i + 1
+  {
+    file_type,
+    confidence,
+    reason,
+    offset,
+    matched_len,
+    candidates,
+    score,
+    evidence,
   }
-  true
 }
 
 ///|
 fn unknown_detection(reason : String) -> Detection {
-  {
-    file_type: None,
-    confidence: Unknown,
-    reason,
-    offset: 0,
-    matched_len: 0,
-    candidates: [],
-  }
+  make_detection(None, reason, [], [])
+}
+
+///|
+fn signature_evidence(sig : Signature) -> Evidence {
+  evidence(
+    "magic",
+    sig.label,
+    sig.offset,
+    sig.magic.length(),
+    if sig.strong {
+      W_STRONG
+    } else {
+      W_WEAK
+    },
+  )
 }
 
 ///|
 fn certain_detection(sig : Signature) -> Detection {
-  {
-    file_type: Some(sig.file_type),
-    confidence: if sig.strong {
-      Certain
-    } else {
-      Probable
-    },
-    reason: sig.label,
-    offset: sig.offset,
-    matched_len: sig.magic.length(),
-    candidates: [],
-  }
+  make_detection(
+    Some(sig.file_type),
+    sig.label,
+    [signature_evidence(sig)],
+    [],
+  )
 }
 
 ///|
-fn refined_detection(
+/// 由「魔数 + 结构证据」构造结果。
+fn structured_detection(
   sig : Signature,
   file_type : FileType,
-  confidence : Confidence,
   reason : String,
+  structure_label : String,
+  structure_weight : Int,
 ) -> Detection {
-  {
-    file_type: Some(file_type),
-    confidence,
+  make_detection(
+    Some(file_type),
     reason,
-    offset: sig.offset,
-    matched_len: sig.magic.length(),
-    candidates: [],
-  }
+    [
+      signature_evidence(sig),
+      evidence("structure", structure_label, 0, 0, structure_weight),
+    ],
+    [],
+  )
 }
 
 ///|
 fn with_candidates(
   sig : Signature,
   file_type : FileType,
-  confidence : Confidence,
   reason : String,
+  structure_label : String,
   candidates : Array[FileType],
 ) -> Detection {
-  {
-    file_type: Some(file_type),
-    confidence,
+  make_detection(
+    Some(file_type),
     reason,
-    offset: sig.offset,
-    matched_len: sig.magic.length(),
+    [
+      signature_evidence(sig),
+      evidence("structure", structure_label, 0, 0, W_STRUCTURE),
+    ],
     candidates,
-  }
+  )
 }
 
 // ---------------------------------------------------------------------------
-// 容器消歧
+// 容器消歧：全部基于结构解析
 // ---------------------------------------------------------------------------
 
 ///|
+/// 读取 ZIP 第一个条目的 mimetype 内容（EPUB / ODF 规范要求它 stored 且排第一）。
+fn zip_declared_mimetype(data : Bytes, archive : ZipArchive) -> String? {
+  if archive.entries.length() == 0 {
+    return None
+  }
+  let first = archive.entries[0]
+  if first.name != "mimetype" || first.compression != 0 {
+    return None
+  }
+  match zip_entry_content(data, first) {
+    Some(content) => Some(raw_string(content, 0, content.length()))
+    None => None
+  }
+}
+
+///|
 fn refine_zip(sig : Signature, data : Bytes) -> Detection {
-  let limit = 65536
-  if contains_bytes(data, b"application/epub+zip", limit) {
-    return refined_detection(
-      sig,
-      epub,
-      Probable,
-      "ZIP 容器内包含 EPUB mimetype 声明",
+  let archive = match parse_zip(data) {
+    Some(a) => a
+    None =>
+      return make_detection(
+        Some(zip),
+        "ZIP 文件头，但中央目录无法解析（可能被截断或不是 ZIP）",
+        [signature_evidence(sig)],
+        [],
+      )
+  }
+  let names = zip_entry_names(archive)
+  let parsed = "\{archive.entries.length()}/\{archive.declared_entries}"
+  let layout = "中央目录解析成功（\{parsed} 条目）"
+  match zip_declared_mimetype(data, archive) {
+    Some(mime) =>
+      if mime == "application/epub+zip" {
+        return structured_detection(
+          sig, epub, "ZIP 首条目 mimetype 声明为 EPUB", "首条目是 stored 的 mimetype", W_DECISIVE,
+        )
+      } else if mime == "application/vnd.oasis.opendocument.text" {
+        return structured_detection(
+          sig, odt, "ZIP 首条目 mimetype 声明为 OpenDocument text", "首条目是 stored 的 mimetype", W_DECISIVE,
+        )
+      } else if mime == "application/vnd.oasis.opendocument.spreadsheet" {
+        return structured_detection(
+          sig, ods, "ZIP 首条目 mimetype 声明为 OpenDocument spreadsheet", "首条目是 stored 的 mimetype", W_DECISIVE,
+        )
+      } else if mime == "application/vnd.oasis.opendocument.presentation" {
+        return structured_detection(
+          sig, odp, "ZIP 首条目 mimetype 声明为 OpenDocument presentation", "首条目是 stored 的 mimetype", W_DECISIVE,
+        )
+      }
+    None => ()
+  }
+  // OOXML：必须有 [Content_Types].xml，且主文档部件独立出现
+  if contains_name(names, "[Content_Types].xml") {
+    if contains_name(names, "word/document.xml") {
+      return structured_detection(
+        sig, docx, "OOXML：存在 word/document.xml 与 [Content_Types].xml", layout, W_STRUCTURE,
+      )
+    }
+    if contains_name(names, "xl/workbook.xml") {
+      return structured_detection(
+        sig, xlsx, "OOXML：存在 xl/workbook.xml 与 [Content_Types].xml", layout, W_STRUCTURE,
+      )
+    }
+    if contains_name(names, "ppt/presentation.xml") {
+      return structured_detection(
+        sig, pptx, "OOXML：存在 ppt/presentation.xml 与 [Content_Types].xml", layout, W_STRUCTURE,
+      )
+    }
+  }
+  if contains_name(names, "FixedDocSeq.fdseq") {
+    return structured_detection(
+      sig, xps, "XPS：存在 FixedDocSeq.fdseq", layout, W_STRUCTURE,
     )
   }
-  if contains_bytes(data, b"application/vnd.oasis.opendocument.text", limit) {
-    return refined_detection(
-      sig,
-      odt,
-      Probable,
-      "ZIP 容器内包含 OpenDocument text mimetype",
+  if contains_name(names, "AndroidManifest.xml") &&
+    contains_name(names, "classes.dex") {
+    return structured_detection(
+      sig, apk, "APK：同时存在 AndroidManifest.xml 与 classes.dex", layout, W_DECISIVE,
     )
   }
-  if contains_bytes(
-      data, b"application/vnd.oasis.opendocument.spreadsheet", limit,
-    ) {
-    return refined_detection(
-      sig,
-      ods,
-      Probable,
-      "ZIP 容器内包含 OpenDocument spreadsheet mimetype",
+  if contains_name(names, "META-INF/MANIFEST.MF") {
+    return structured_detection(
+      sig, jar, "JAR：存在 META-INF/MANIFEST.MF 且无 classes.dex", layout, W_STRUCTURE,
     )
   }
-  if contains_bytes(
-      data, b"application/vnd.oasis.opendocument.presentation", limit,
-    ) {
-    return refined_detection(
-      sig,
-      odp,
-      Probable,
-      "ZIP 容器内包含 OpenDocument presentation mimetype",
-    )
+  structured_detection(sig, zip, "ZIP 中央目录结构有效，未发现更具体的容器特征", layout, W_STRUCTURE)
+}
+
+///|
+fn refine_ole2(sig : Signature, data : Bytes) -> Detection {
+  match parse_ole2_streams(data) {
+    Some(names) =>
+      if contains_name(names, "WordDocument") {
+        return structured_detection(
+          sig, doc, "OLE2 目录中存在 WordDocument 流", "FAT 与目录扇区解析成功", W_DECISIVE,
+        )
+      } else if contains_name(names, "Workbook") ||
+        contains_name(names, "Book") {
+        return structured_detection(
+          sig, xls, "OLE2 目录中存在 Workbook/Book 流", "FAT 与目录扇区解析成功", W_DECISIVE,
+        )
+      } else if contains_name(names, "PowerPoint Document") {
+        return structured_detection(
+          sig, ppt, "OLE2 目录中存在 PowerPoint Document 流", "FAT 与目录扇区解析成功", W_DECISIVE,
+        )
+      }
+    None => ()
   }
-  if contains_bytes(data, b"FixedDocSeq.fdseq", limit) {
-    return refined_detection(
-      sig,
-      xps,
-      Probable,
-      "ZIP 容器内包含 XPS 固定文档序列",
-    )
-  }
-  if contains_bytes(data, b"AndroidManifest.xml", limit) {
-    return refined_detection(
-      sig,
-      apk,
-      Probable,
-      "ZIP 容器内包含 AndroidManifest.xml",
-    )
-  }
-  if contains_bytes(data, b"META-INF/MANIFEST.MF", limit) {
-    return refined_detection(
-      sig,
-      jar,
-      Probable,
-      "ZIP 容器内包含 META-INF/MANIFEST.MF",
-    )
-  }
-  if contains_bytes(data, b"word/", limit) {
-    return refined_detection(
-      sig,
-      docx,
-      Probable,
-      "ZIP 容器内包含 word/ 目录",
-    )
-  }
-  if contains_bytes(data, b"xl/", limit) {
-    return refined_detection(
-      sig,
-      xlsx,
-      Probable,
-      "ZIP 容器内包含 xl/ 目录",
-    )
-  }
-  if contains_bytes(data, b"ppt/", limit) {
-    return refined_detection(
-      sig,
-      pptx,
-      Probable,
-      "ZIP 容器内包含 ppt/ 目录",
-    )
-  }
-  certain_detection(sig)
+  with_candidates(
+    sig,
+    ole2,
+    "OLE2 复合文档头；目录结构无法解析或未包含已知流",
+    "仅头部校验通过",
+    [doc, xls, ppt],
+  )
 }
 
 ///|
 fn refine_riff(sig : Signature, data : Bytes) -> Detection {
-  if match_at(data, 8, b"WAVE") {
-    return refined_detection(sig, wav, Certain, "RIFF 容器，子类型 WAVE")
+  let info = match parse_riff(data) {
+    Some(v) => v
+    None =>
+      return with_candidates(
+        sig, riff, "RIFF 容器，但 chunk 结构无法解析", "header 校验通过", [wav, avi, webp],
+      )
   }
-  if match_at(data, 8, b"AVI ") {
-    return refined_detection(sig, avi, Certain, "RIFF 容器，子类型 AVI ")
+  if info.form == "WAVE" &&
+    contains_name(info.chunks, "fmt ") &&
+    contains_name(info.chunks, "data") {
+    return structured_detection(
+      sig, wav, "RIFF/WAVE，且 fmt 与 data chunk 都存在", "chunk 遍历命中 fmt + data", W_DECISIVE,
+    )
   }
-  if match_at(data, 8, b"WEBP") {
-    return refined_detection(sig, webp, Certain, "RIFF 容器，子类型 WEBP")
+  if info.form == "AVI " &&
+    (contains_name(info.chunks, "hdrl") || contains_name(info.chunks, "movi")) {
+    return structured_detection(
+      sig, avi, "RIFF/AVI，且 hdrl 或 movi chunk 存在", "chunk 遍历命中 AVI 必需块", W_DECISIVE,
+    )
   }
-  with_candidates(sig, riff, Probable, "RIFF 容器，但子类型未知", [
-    wav, avi, webp,
-  ])
+  if info.form == "WEBP" &&
+    (contains_name(info.chunks, "VP8 ") ||
+      contains_name(info.chunks, "VP8L") ||
+      contains_name(info.chunks, "VP8X")) {
+    return structured_detection(
+      sig, webp, "RIFF/WEBP，且存在 VP8/VP8L/VP8X chunk", "chunk 遍历命中 WebP 编码块", W_DECISIVE,
+    )
+  }
+  with_candidates(
+    sig,
+    riff,
+    "RIFF 容器，子类型未知或缺少必需 chunk",
+    "chunk 遍历未命中已知子类型",
+    [wav, avi, webp],
+  )
+}
+
+///|
+fn refine_iff(sig : Signature, data : Bytes) -> Detection {
+  match parse_iff(data) {
+    Some(info) =>
+      if (info.form == "AIFF" || info.form == "AIFC") &&
+        contains_name(info.chunks, "COMM") {
+        return structured_detection(
+          sig, aiff, "IFF/AIFF，且存在 COMM chunk", "chunk 遍历命中 COMM", W_DECISIVE,
+        )
+      }
+    None => ()
+  }
+  with_candidates(
+    sig, iff, "IFF 容器，但子类型未知", "header 校验通过", [aiff],
+  )
 }
 
 ///|
 fn refine_ftyp(sig : Signature, data : Bytes) -> Detection {
-  if match_at(data, 8, b"avif") || match_at(data, 8, b"avis") {
-    return refined_detection(sig, avif, Certain, "ftyp brand = avif/avis")
+  let brands = bmff_brands(data)
+  let handlers = bmff_handlers(data)
+  let brand_label = if brands.length() > 0 {
+    "ftyp major brand = \{brands[0]}"
+  } else {
+    "ftyp 已解析"
   }
-  if match_at(data, 8, b"heic") ||
-    match_at(data, 8, b"heix") ||
-    match_at(data, 8, b"hevc") ||
-    match_at(data, 8, b"hevx") ||
-    match_at(data, 8, b"mif1") ||
-    match_at(data, 8, b"msf1") {
-    return refined_detection(sig, heic, Certain, "ftyp brand = HEIF 系列")
+  if contains_name(brands, "avif") || contains_name(brands, "avis") {
+    return structured_detection(
+      sig, avif, "ISO-BMFF：brand 为 avif/avis", brand_label, W_DECISIVE,
+    )
   }
-  if match_at(data, 8, b"M4A ") || match_at(data, 8, b"M4B ") {
-    return refined_detection(sig, m4a, Certain, "ftyp brand = M4A/M4B")
+  if contains_name(brands, "heic") ||
+    contains_name(brands, "heix") ||
+    contains_name(brands, "hevc") ||
+    contains_name(brands, "hevx") ||
+    contains_name(brands, "mif1") ||
+    contains_name(brands, "msf1") {
+    return structured_detection(
+      sig, heic, "ISO-BMFF：brand 属于 HEIF 系列", brand_label, W_DECISIVE,
+    )
   }
-  if match_at(data, 8, b"3gp4") ||
-    match_at(data, 8, b"3gp5") ||
-    match_at(data, 8, b"3gp6") ||
-    match_at(data, 8, b"3g2a") {
-    return refined_detection(sig, threegp, Certain, "ftyp brand = 3GP 系列")
+  if contains_name(brands, "M4A ") || contains_name(brands, "M4B ") {
+    return structured_detection(
+      sig, m4a, "ISO-BMFF：brand 为 M4A/M4B", brand_label, W_DECISIVE,
+    )
   }
-  if match_at(data, 8, b"qt  ") {
-    return refined_detection(sig, mov, Certain, "ftyp brand = qt  ")
+  if contains_name(brands, "3gp4") ||
+    contains_name(brands, "3gp5") ||
+    contains_name(brands, "3gp6") ||
+    contains_name(brands, "3g2a") {
+    return structured_detection(
+      sig, threegp, "ISO-BMFF：brand 属于 3GP 系列", brand_label, W_DECISIVE,
+    )
   }
-  if match_at(data, 8, b"isom") ||
-    match_at(data, 8, b"iso2") ||
-    match_at(data, 8, b"mp41") ||
-    match_at(data, 8, b"mp42") ||
-    match_at(data, 8, b"M4V ") ||
-    match_at(data, 8, b"dash") {
-    return refined_detection(sig, mp4, Certain, "ftyp brand = MP4 系列")
+  if contains_name(brands, "qt  ") {
+    return structured_detection(
+      sig, mov, "ISO-BMFF：brand 为 QuickTime", brand_label, W_DECISIVE,
+    )
   }
-  with_candidates(sig, ftyp, Probable, "ISO BMFF 容器，但 brand 未知", [
-    mp4, mov, heic,
-  ])
+  if contains_name(handlers, "vide") {
+    return structured_detection(
+      sig, mp4, "ISO-BMFF：mdia/hdlr 声明 vide", "box 树下钻到 hdlr = vide", W_DECISIVE,
+    )
+  }
+  if contains_name(handlers, "soun") {
+    return structured_detection(
+      sig, m4a, "ISO-BMFF：mdia/hdlr 仅声明 soun", "box 树下钻到 hdlr = soun", W_DECISIVE,
+    )
+  }
+  if contains_name(brands, "isom") ||
+    contains_name(brands, "iso2") ||
+    contains_name(brands, "mp41") ||
+    contains_name(brands, "mp42") ||
+    contains_name(brands, "M4V ") ||
+    contains_name(brands, "dash") {
+    return with_candidates(
+      sig,
+      mp4,
+      "ISO-BMFF：brand 属于 MP4 系列，但未找到 handler",
+      brand_label,
+      [mov, m4a],
+    )
+  }
+  with_candidates(
+    sig,
+    ftyp,
+    "ISO-BMFF 容器，但 brand 未知",
+    "box 头解析通过",
+    [mp4, mov, heic],
+  )
+}
+
+///|
+fn refine_ebml(sig : Signature, data : Bytes) -> Detection {
+  match ebml_doctype(data) {
+    Some(doc_type) =>
+      if doc_type == "webm" {
+        return structured_detection(
+          sig, webm, "EBML DocType = webm", "vint 解析出 DocType 元素", W_DECISIVE,
+        )
+      } else if doc_type == "matroska" {
+        return structured_detection(
+          sig, mkv, "EBML DocType = matroska", "vint 解析出 DocType 元素", W_DECISIVE,
+        )
+      }
+    None => ()
+  }
+  with_candidates(
+    sig, ebml, "EBML 容器，但未解析出 DocType", "EBML 头结构有效", [mkv, webm],
+  )
+}
+
+///|
+fn refine_ogg(sig : Signature, data : Bytes) -> Detection {
+  if data.length() >= 27 {
+    let segments = data[26].to_int()
+    if segments > 0 && 27 + segments < data.length() {
+      let packet_start = 27 + segments
+      let packet_len = data[27].to_int()
+      match slice_bytes(data, packet_start, packet_start + packet_len) {
+        Some(packet) =>
+          if match_at(packet, 0, b"OpusHead") {
+            return structured_detection(
+              sig, opus, "Ogg 首页首包为 OpusHead", "按 Ogg 页布局解析出首包", W_DECISIVE,
+            )
+          }
+        None => ()
+      }
+    }
+  }
+  certain_detection(sig)
 }
 
 ///|
@@ -323,11 +439,8 @@ fn refine_cafebabe(sig : Signature, data : Bytes) -> Detection {
   match u32_be(data, 4) {
     Some(count) =>
       if count >= 1 && count <= 16 {
-        return refined_detection(
-          sig,
-          macho,
-          Probable,
-          "Mach-O universal binary (nfat_arch 合理)",
+        return structured_detection(
+          sig, macho, "Mach-O universal binary：nfat_arch 合理", "fat header 的 nfat_arch 在 1..16", W_STRUCTURE,
         )
       }
     None => ()
@@ -335,11 +448,8 @@ fn refine_cafebabe(sig : Signature, data : Bytes) -> Detection {
   match u16_be(data, 6) {
     Some(major) =>
       if major >= 45 && major <= 70 {
-        return refined_detection(
-          sig,
-          java_class,
-          Probable,
-          "Java class 主版本号在 45..70 之间",
+        return structured_detection(
+          sig, java_class, "Java class：主版本号在 45..70", "class 文件版本字段校验通过", W_STRUCTURE,
         )
       }
     None => ()
@@ -347,8 +457,8 @@ fn refine_cafebabe(sig : Signature, data : Bytes) -> Detection {
   with_candidates(
     sig,
     cafebabe,
-    Probable,
     "CAFEBABE 头，但无法确定是 Mach-O fat 还是 Java class",
+    "两种结构的判别字段都不成立",
     [macho, java_class],
   )
 }
@@ -358,11 +468,8 @@ fn refine_ttf_raw(sig : Signature, data : Bytes) -> Detection {
   match u16_be(data, 4) {
     Some(tables) =>
       if tables >= 1 && tables <= 512 {
-        refined_detection(
-          sig,
-          ttf,
-          Probable,
-          "TrueType sfnt 版本 0x00010000，表数量合理",
+        structured_detection(
+          sig, ttf, "TrueType sfnt：表数量合理", "sfnt offset table 的 numTables 在 1..512", W_STRUCTURE,
         )
       } else {
         unknown_detection("以 0x00010000 开头，但 sfnt 表数量异常")
@@ -373,70 +480,119 @@ fn refine_ttf_raw(sig : Signature, data : Bytes) -> Detection {
 
 ///|
 fn refine_pe(sig : Signature, data : Bytes) -> Detection {
-  match u32_le(data, 60) {
-    Some(pe_offset) =>
-      if match_at(data, pe_offset, b"PE\x00\x00") {
-        refined_detection(sig, pe, Certain, "MZ 头 + PE\\0\\0 签名")
-      } else {
-        refined_detection(sig, pe, Probable, "MZ 头，但未找到 PE 签名")
-      }
-    None => refined_detection(sig, pe, Probable, "MZ 头，但文件过短")
+  match parse_pe(data) {
+    Some(info) => {
+      let kind = if info.is_dll { "DLL" } else { "EXE" }
+      return structured_detection(
+        sig,
+        pe,
+        "PE 结构有效：\{pe_machine_name(info)}，\{kind}，\{info.sections} 个节",
+        "e_lfanew 指向合法 PE 头，COFF/Optional Header 校验通过",
+        W_DECISIVE,
+      )
+    }
+    None => ()
   }
+  let limit = if data.length() < 4096 { data.length() } else { 4096 }
+  if looks_like_text(data, limit) {
+    return detect_text(data)
+  }
+  make_detection(
+    Some(pe),
+    "MZ 头，但 e_lfanew 指向的不是合法 PE 头",
+    [signature_evidence(sig)],
+    [],
+  )
 }
 
 ///|
-fn refine_ebml(sig : Signature, data : Bytes) -> Detection {
-  if contains_bytes(data, b"webm", 4096) {
-    return refined_detection(
-      sig,
-      webm,
-      Probable,
-      "EBML 容器内包含 webm DocType",
-    )
+/// BMP 的结构校验：保留字段必须为 0，DIB header 大小必须在已知取值集合内。
+fn refine_bmp(sig : Signature, data : Bytes) -> Detection {
+  if data.length() >= 30 {
+    let reserved = u32_le(data, 6)
+    let dib = u32_le(data, 14)
+    match reserved {
+      Some(r) =>
+        match dib {
+          Some(size) =>
+            if r == 0 &&
+              (size == 12 ||
+                size == 40 ||
+                size == 52 ||
+                size == 56 ||
+                size == 64 ||
+                size == 108 ||
+                size == 124) {
+              return structured_detection(
+                sig,
+                bmp,
+                "BMP 结构有效：DIB header = \{size}",
+                "保留字段为 0 且 DIB header 大小合法",
+                W_DECISIVE,
+              )
+            }
+          None => ()
+        }
+      None => ()
+    }
   }
-  if contains_bytes(data, b"matroska", 4096) {
-    return refined_detection(
-      sig,
-      mkv,
-      Probable,
-      "EBML 容器内包含 matroska DocType",
-    )
+  let limit = if data.length() < 4096 { data.length() } else { 4096 }
+  if looks_like_text(data, limit) {
+    return detect_text(data)
   }
-  with_candidates(sig, ebml, Probable, "EBML 容器，但未找到 DocType", [
-    mkv, webm,
-  ])
+  make_detection(
+    Some(bmp),
+    "BM 头，但 DIB header 未通过校验",
+    [signature_evidence(sig)],
+    [],
+  )
 }
 
 ///|
-fn refine_ogg(sig : Signature, data : Bytes) -> Detection {
-  if contains_bytes(data, b"OpusHead", 512) {
-    return refined_detection(
-      sig,
-      opus,
-      Probable,
-      "Ogg 容器内包含 OpusHead",
-    )
+/// PNM 的弱签名要求魔数后紧跟空白字符。
+fn refine_pnm(sig : Signature, data : Bytes) -> Detection {
+  if data.length() > sig.magic.length() {
+    let next = data[sig.magic.length()].to_int()
+    if next == 32 || next == 9 || next == 10 || next == 13 {
+      return make_detection(
+        Some(pnm),
+        "PNM 魔数后紧跟空白字符",
+        [
+          signature_evidence(sig),
+          evidence("structure", "PNM 魔数后是分隔符", sig.magic.length(), 1, W_STRUCTURE),
+        ],
+        [],
+      )
+    }
   }
-  certain_detection(sig)
+  detect_text(data)
 }
 
 ///|
-fn refine_iff(sig : Signature, data : Bytes) -> Detection {
-  if match_at(data, 8, b"AIFF") || match_at(data, 8, b"AIFC") {
-    return refined_detection(
+fn refine_tar(sig : Signature, data : Bytes) -> Detection {
+  if tar_checksum_ok(data) {
+    return structured_detection(
       sig,
-      aiff,
-      Certain,
-      "IFF 容器，子类型 AIFF/AIFC",
+      tar,
+      "tar header 的八进制 checksum 校验通过",
+      "512 字节 header 的 checksum 与内容一致",
+      W_DECISIVE,
     )
   }
-  with_candidates(sig, iff, Probable, "IFF 容器，但子类型未知", [aiff])
+  make_detection(
+    Some(tar),
+    "存在 ustar 标识，但 header checksum 不匹配",
+    [signature_evidence(sig)],
+    [],
+  )
 }
 
 ///|
 fn refine_postscript(sig : Signature, data : Bytes) -> Detection {
-  if contains_bytes(data, b"%!PS-AdobeFont", 64) {
-    return refined_detection(sig, pfa, Probable, "PostScript Type 1 字体头")
+  if match_at(data, 0, b"%!PS-AdobeFont") || match_at(data, 0, b"%!FontType1") {
+    return structured_detection(
+      sig, pfa, "PostScript Type 1 字体头", "Adobe Font 专用标识匹配", W_STRUCTURE,
+    )
   }
   certain_detection(sig)
 }
@@ -446,8 +602,8 @@ fn refine_asf(sig : Signature, _data : Bytes) -> Detection {
   with_candidates(
     sig,
     asf,
-    Probable,
     "ASF 容器；仅凭头部无法区分 wma / wmv",
+    "ASF header GUID 匹配",
     [wma, wmv],
   )
 }
@@ -457,28 +613,19 @@ fn refine(sig : Signature, data : Bytes) -> Detection {
   match sig.file_type.id {
     "zip" => refine_zip(sig, data)
     "riff" => refine_riff(sig, data)
+    "iff" => refine_iff(sig, data)
     "ftyp" => refine_ftyp(sig, data)
     "ebml" => refine_ebml(sig, data)
     "ogg" => refine_ogg(sig, data)
-    "iff" => refine_iff(sig, data)
     "postscript" => refine_postscript(sig, data)
     "asf" => refine_asf(sig, data)
     "cafebabe" => refine_cafebabe(sig, data)
     "ttf-raw" => refine_ttf_raw(sig, data)
-    "pe" =>
-      if sig.strong {
-        certain_detection(sig)
-      } else {
-        refine_pe(sig, data)
-      }
-    "ole2" =>
-      with_candidates(
-        sig,
-        ole2,
-        Certain,
-        "OLE2 复合文档头；仅凭头部无法区分 doc / xls / ppt",
-        [doc, xls, ppt],
-      )
+    "tar" => refine_tar(sig, data)
+    "pe" => refine_pe(sig, data)
+    "bmp" => refine_bmp(sig, data)
+    "pnm" => refine_pnm(sig, data)
+    "ole2" => refine_ole2(sig, data)
     _ => certain_detection(sig)
   }
 }
@@ -591,13 +738,26 @@ fn looks_like_delimited(data : Bytes, limit : Int, separator : Int) -> Bool {
 }
 
 ///|
-fn looks_like_csv(data : Bytes, limit : Int) -> Bool {
-  looks_like_delimited(data, limit, 44)
-}
-
-///|
-fn looks_like_tsv(data : Bytes, limit : Int) -> Bool {
-  looks_like_delimited(data, limit, 9)
+fn starts_with_ci(data : Bytes, pattern : Bytes) -> Bool {
+  if data.length() < pattern.length() {
+    return false
+  }
+  let mut i = 0
+  while i < pattern.length() {
+    let mut a = data[i].to_int()
+    let mut b = pattern[i].to_int()
+    if a >= 65 && a <= 90 {
+      a = a + 32
+    }
+    if b >= 65 && b <= 90 {
+      b = b + 32
+    }
+    if a != b {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 ///|
@@ -607,14 +767,12 @@ fn text_detection(
   offset : Int,
   matched_len : Int,
 ) -> Detection {
-  {
-    file_type: Some(file_type),
-    confidence: Probable,
+  make_detection(
+    Some(file_type),
     reason,
-    offset,
-    matched_len,
-    candidates: [],
-  }
+    [evidence("heuristic", reason, offset, matched_len, W_HEURISTIC)],
+    [],
+  )
 }
 
 ///|
@@ -639,15 +797,13 @@ fn detect_text(data : Bytes) -> Detection {
   if starts_with_ci(data, b"<html") {
     return text_detection(html, "以 <html 开头", 0, 5)
   }
-  if looks_like_tsv(data, limit) {
+  if looks_like_delimited(data, limit, 9) {
     return text_detection(tsv, "前两行的制表符数量一致", 0, 0)
   }
-  if looks_like_csv(data, limit) {
+  if looks_like_delimited(data, limit, 44) {
     return text_detection(csv, "前两行的逗号数量一致", 0, 0)
   }
-  text_detection(
-    plain_text, "可打印文本，未命中更具体的类型", 0, 0,
-  )
+  text_detection(plain_text, "可打印文本，未命中更具体的类型", 0, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -657,30 +813,88 @@ fn detect_text(data : Bytes) -> Detection {
 ///|
 /// MPEG-TS 的同步字节 0x47 每隔 188 字节出现一次。
 fn looks_like_mpeg_ts(data : Bytes) -> Bool {
-  data.length() >= 377 &&
-  data[0].to_int() == 71 &&
-  data[188].to_int() == 71 &&
-  data[376].to_int() == 71
+  if data.length() < 377 {
+    return false
+  }
+  let mut i = 0
+  let mut hits = 0
+  while i < data.length() && i < 188 * 8 {
+    if data[i].to_int() == 71 {
+      hits = hits + 1
+    }
+    i = i + 188
+  }
+  hits >= 3
 }
 
 ///|
-/// 根据字节内容识别文件类型。
-///
-/// 该函数是纯函数：不读文件、不访问网络、不依赖系统状态。
-pub fn detect(data : Bytes) -> Detection {
-  if data.length() == 0 {
-    return unknown_detection("空输入")
-  }
+/// 内置签名与容器判定；没有命中时返回 `None`（不包含文本启发式）。
+fn detect_signatures(data : Bytes) -> Detection? {
   if looks_like_mpeg_ts(data) {
-    return text_detection(ts, "MPEG-TS 同步字节位于 0/188/376", 0, 1)
+    return Some(
+      make_detection(
+        Some(ts),
+        "MPEG-TS：0x47 同步字节按 188 字节周期出现",
+        [
+          evidence("structure", "0x47 同步字节周期为 188", 0, 1, W_DECISIVE),
+        ],
+        [],
+      ),
+    )
   }
   let mut i = 0
   while i < signatures.length() {
     let sig = signatures[i]
     if match_at(data, sig.offset, sig.magic) {
-      return refine(sig, data)
+      return Some(refine(sig, data))
     }
     i = i + 1
+  }
+  None
+}
+
+///|
+/// 根据字节内容识别文件类型（使用内置规则集）。
+///
+/// 该函数是纯函数：不读文件、不访问网络、不依赖系统状态。
+pub fn detect(data : Bytes) -> Detection {
+  detect_with(Registry::new(), data)
+}
+
+///|
+/// 使用自定义规则集与检测器识别文件类型。
+///
+/// 优先级：用户规则 → 内置签名与容器判定 → 用户检测器 → 文本启发式。
+pub fn detect_with(registry : Registry, data : Bytes) -> Detection {
+  if data.length() == 0 {
+    return unknown_detection("空输入")
+  }
+  for rule in registry.rules {
+    match eval_matcher(rule.matcher, data) {
+      Some(offset) =>
+        return make_detection(
+          Some({
+            id: rule.id,
+            mime: rule.mime,
+            ext: rule.ext,
+            category: rule.category,
+          }),
+          rule.label,
+          [rule_evidence(rule, offset)],
+          [],
+        )
+      None => ()
+    }
+  }
+  match detect_signatures(data) {
+    Some(detection) => return detection
+    None => ()
+  }
+  for detector in registry.detectors {
+    match detector(data) {
+      Some(detection) => return detection
+      None => ()
+    }
   }
   detect_text(data)
 }

@@ -78,12 +78,19 @@ pub fn render_text(
     }
   }
   builder.write_string(
-    "  confidence: \{confidence_name(detection.confidence)}\n",
+    "  confidence: \{confidence_name(detection.confidence)} (\{detection.score}/100)\n",
   )
   builder.write_string("  evidence:   \{detection.reason}\n")
   if explain {
     builder.write_string("  offset:     \{detection.offset}\n")
     builder.write_string("  bytes:      \{detection.matched_len}\n")
+    let mut index = 1
+    for item in detection.evidence {
+      builder.write_string(
+        "    [\{index}] \{item.kind} +\{item.weight} @\{item.offset}: \{item.label}\n",
+      )
+      index = index + 1
+    }
   }
   if detection.candidates.length() > 0 {
     builder.write_string("  candidates: ")
@@ -124,9 +131,24 @@ pub fn render_json(path : String, detection : Detection) -> String {
   builder.write_string(
     ",\"confidence\":\"\{confidence_name(detection.confidence)}\"",
   )
+  builder.write_string(",\"score\":\{detection.score}")
   builder.write_string(",\"offset\":\{detection.offset}")
   builder.write_string(",\"bytes\":\{detection.matched_len}")
   builder.write_string(",\"reason\":\"\{json_escape(detection.reason)}\"")
+  builder.write_string(",\"evidence\":[")
+  let mut first_evidence = true
+  for item in detection.evidence {
+    if !first_evidence {
+      builder.write_string(",")
+    }
+    builder.write_string("{\"kind\":\"\{json_escape(item.kind)}\"")
+    builder.write_string(",\"label\":\"\{json_escape(item.label)}\"")
+    builder.write_string(",\"offset\":\{item.offset}")
+    builder.write_string(",\"bytes\":\{item.matched_len}")
+    builder.write_string(",\"weight\":\{item.weight}}")
+    first_evidence = false
+  }
+  builder.write_string("]")
   builder.write_string(",\"candidates\":[")
   let mut first = true
   for candidate in detection.candidates {
