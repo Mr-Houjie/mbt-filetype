@@ -1,6 +1,9 @@
 # mbt-filetype
 
-零依赖的 MoonBit 文件类型识别与内容嗅探引擎：结构解析、证据链判定、可扩展规则，附命令行工具。
+[![CI](https://github.com/Mr-Houjie/mbt-filetype/actions/workflows/ci.yml/badge.svg)](https://github.com/Mr-Houjie/mbt-filetype/actions/workflows/ci.yml)
+
+核心库无第三方依赖的 MoonBit 文件类型识别与内容嗅探引擎：结构解析、证据链判定、可扩展规则，附命令行工具
+（CLI 仅使用官方 `moonbitlang/x` 读写文件）。
 
 `mbt-filetype` 回答一个很具体的问题：**这段字节到底是什么文件？** 它不根据扩展名猜测，
 而是按格式规范解析字节结构，并给出可核对、可加权的证据链。
@@ -14,6 +17,11 @@
 - **确定性**：纯函数识别，不访问网络、不依赖时区与 locale
 - **边界安全**：所有字节访问都先检查长度，任意输入都不会越界；附带固定种子 fuzz
 - **CI 友好**：`--expect` 断言类型，`--scan` 报告扩展名与内容不符的文件
+
+## 环境要求
+
+- MoonBit 工具链，`moonc` 版本不低于 **0.10.16**（开发与 CI 使用 0.10.18 验证）
+- 查看当前版本：`moon version --all`
 
 ## 安装
 
@@ -115,6 +123,10 @@ moon run cmd/main -- --scan examples
 moon run cmd/main -- --list-types
 ```
 
+退出码：`0` 正常、`1` 断言不匹配或扫描发现扩展名不符、`2` 用法错误或读写失败。
+`--scan` 配合 `--json` 时，stdout 只有 JSON 行，统计摘要写入 stderr。
+（`corpus/bundle.zip` 是故意命名为 `.zip` 的 docx，用于演示扩展名不符的检出，因此扫描该目录会返回 1。）
+
 ## 支持等级与判定终点
 
 支持范围分三级，不是所有类型都走结构解析——这一点写在前面，避免误解：
@@ -158,9 +170,12 @@ B 级的实现细节见 `signatures.mbt`（魔数表 + 字段校验），A 级�
 由结构构造器与对抗样本覆盖，真实样本对拍列入下一轮。
 
 ```bash
-moon test          # 标准测试（部分 Windows 环境受嵌套进程限制）
-moon run cmd/verify  # 独立自检入口，与 moon test 等价
+moon test            # 单元测试（17 个用例全部通过）
+moon run cmd/verify  # 独立自检入口，逐条跑完 142 条一致性用例
 ```
+
+CI 在 `ubuntu-latest` 上依次执行 `moon check --deny-warn`、`moon build`、`moon test`
+与 `cmd/verify` 自检，并断言 `moonc` 版本不低于 0.10.16。
 
 ## 跨库一致性对拍
 
