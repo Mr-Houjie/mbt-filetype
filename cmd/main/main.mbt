@@ -4,7 +4,7 @@
 // 参数解析、文件读写、输出与退出码。
 
 ///|
-const VERSION : String = "0.2.0"
+const VERSION : String = "0.2.1"
 
 ///|
 fn usage() -> String {
@@ -86,6 +86,16 @@ fn usage_error(message : String) -> Unit {
   println("")
   output(usage())
   @sys.exit(2)
+}
+
+///|
+/// 输出诊断信息：JSON 模式下写 stderr，避免污染 stdout 的 JSON 流。
+fn report(options : Options, message : String) -> Unit {
+  if options.json {
+    eprintln(message)
+  } else {
+    println(message)
+  }
 }
 
 ///|
@@ -246,6 +256,7 @@ fn join_path(directory : String, name : String) -> String {
 struct ScanStats {
   mut total : Int
   mut mismatches : Int
+  mut io_error : Bool
 }
 
 ///|
@@ -287,12 +298,13 @@ fn scan_directory(
   stats : ScanStats,
 ) -> Unit {
   if depth > 32 {
-    println("扫描深度超过 32，跳过「\{directory}」")
+    report(options, "扫描深度超过 32，跳过「\{directory}」")
     return
   }
   let entries = @fs.read_dir(directory) catch {
     _ => {
-      println("无法读取目录「\{directory}」")
+      report(options, "无法读取目录「\{directory}」")
+      stats.io_error = true
       return
     }
   }
@@ -339,14 +351,20 @@ fn main {
   }
   match options.scan {
     Some(directory) => {
-      let stats = { total: 0, mismatches: 0, }
+      let stats = { total: 0, mismatches: 0, io_error: false, }
       scan_directory(directory, 0, options, stats)
-      println("")
-      println(
-        "scan: \{stats.total} files, \{stats.mismatches} extension mismatches",
-      )
+      let summary = "scan: \{stats.total} files, \{stats.mismatches} extension mismatches"
+      if options.json {
+        eprintln(summary)
+      } else {
+        println("")
+        println(summary)
+      }
       if stats.mismatches > 0 && code < 1 {
         code = 1
+      }
+      if stats.io_error && code < 2 {
+        code = 2
       }
     }
     None => ()
