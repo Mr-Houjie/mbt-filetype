@@ -28,6 +28,16 @@ jobs:
           moon version --all
           moon update
 
+      - name: Assert moonc >= 0.10.16
+        run: |
+          ver=$(moonc -v | head -n1 | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          echo "moonc version: $ver"
+          required=0.10.16
+          if [ "$(printf '%s\n%s\n' "$required" "$ver" | sort -V | head -n1)" != "$required" ]; then
+            echo "::error::moonc $ver is older than required $required"
+            exit 1
+          fi
+
       - name: Check (type/syntax)
         run: moon check --deny-warn
 
