@@ -4,7 +4,7 @@
 // 参数解析、文件读写、输出与退出码。
 
 ///|
-const VERSION : String = "0.2.1"
+const VERSION : String = "0.2.2"
 
 ///|
 fn usage() -> String {

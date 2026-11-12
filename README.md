@@ -5,6 +5,9 @@
 核心库无第三方依赖的 MoonBit 文件类型识别与内容嗅探引擎：结构解析、证据链判定、可扩展规则，附命令行工具
 （CLI 仅使用官方 `moonbitlang/x` 读写文件）。
 
+> 当前版本 **v0.2.2**。相对第一轮提交，修复了 32 位整数回绕导致的 panic、
+> IFF/AIFC 大端解析错误与截断文件的误判，详见 [RESUBMISSION.md](RESUBMISSION.md)。
+
 `mbt-filetype` 回答一个很具体的问题：**这段字节到底是什么文件？** 它不根据扩展名猜测，
 而是按格式规范解析字节结构，并给出可核对、可加权的证据链。
 
@@ -206,6 +209,15 @@ python tools/crosscheck.py corpus/
 | 归档内部 | 不递归；`--scan` 只报告外层文件 |
 | 文本类 | 一律 `probable`，不与二进制判定混用 |
 | 恶意构造 / 完整性 | 不检测，本库不是安全扫描器 |
+| 32 位字段取到 ≥ 0x80000000 | 视为非法偏移（`u32_le` / `u32_be` 返回 `None`），降级处理，不 panic |
+| 声明长度超过实际数据 | 判为「文件被截断」并降级为 `probable`，不宣称结构完整 |
+
+## 版本记录
+
+- **v0.2.2**：修复 32 位 `Int` 回绕导致的 panic（`e_lfanew`、ZIP `local_offset`
+  取极大值）、IFF/AIFC 大端解析、截断 RIFF/ZIP 的结构判定。详见
+  [RESUBMISSION.md](RESUBMISSION.md)。
+- v0.2.1：`--scan` 无法读取目录时返回退出码 2。
 
 ## 许可证
 
