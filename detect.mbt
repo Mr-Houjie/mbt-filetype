@@ -140,6 +140,28 @@ fn with_candidates(
   )
 }
 
+///|
+/// 结构受损时的降级判定：类型仍然成立，但不足以判 `Certain`。
+///
+/// 只保留「弱证据」的分值，使 `score` 与 `confidence_of_score` 的契约保持一致
+/// （60 分 → `Probable`），而不是给出 100 分却说「可能」。
+fn degraded_detection(
+  sig : Signature,
+  file_type : FileType,
+  reason : String,
+  structure_label : String,
+) -> Detection {
+  make_detection(
+    Some(file_type),
+    reason,
+    [
+      evidence("magic", sig.label, sig.offset, sig.magic.length(), W_WEAK),
+      evidence("structure", structure_label, 0, 0, W_STRUCTURE),
+    ],
+    [],
+  )
+}
+
 // ---------------------------------------------------------------------------
 // 容器消歧：全部基于结构解析
 // ---------------------------------------------------------------------------
@@ -165,13 +187,33 @@ fn refine_zip(sig : Signature, data : Bytes) -> Detection {
   let archive = match parse_zip(data) {
     Some(a) => a
     None =>
-      return make_detection(
-        Some(zip),
+      return degraded_detection(
+        sig,
+        zip,
         "ZIP 文件头，但中央目录无法解析（可能被截断或不是 ZIP）",
-        [signature_evidence(sig)],
-        [],
+        "仅魔数成立，结构未通过",
       )
   }
+  let detection = classify_zip(sig, data, archive)
+  if archive.complete {
+    detection
+  } else {
+    // 中央目录条目数与 EOCD 声明不符：结构只解析了一部分，
+    // 不能宣称「中央目录结构有效」，降级为 Probable 并在原因里写明。
+    degraded_detection(
+      sig,
+      match detection.file_type {
+        Some(t) => t
+        None => zip
+      },
+      "\{detection.reason}（中央目录只解析出 \{archive.entries.length()}/\{archive.declared_entries} 条，文件可能被截断）",
+      "中央目录不完整",
+    )
+  }
+}
+
+///|
+fn classify_zip(sig : Signature, data : Bytes, archive : ZipArchive) -> Detection {
   let names = zip_entry_names(archive)
   let parsed = "\{archive.entries.length()}/\{archive.declared_entries}"
   let layout = "中央目录解析成功（\{parsed} 条目）"
@@ -274,12 +316,28 @@ fn refine_riff(sig : Signature, data : Bytes) -> Detection {
   if info.form == "WAVE" &&
     contains_name(info.chunks, "fmt ") &&
     contains_name(info.chunks, "data") {
+    if info.truncated {
+      return degraded_detection(
+        sig,
+        wav,
+        "RIFF/WAVE，fmt 与 data chunk 头都存在，但声明长度超过实际数据（文件被截断）",
+        "chunk 头存在，chunk 体缺失",
+      )
+    }
     return structured_detection(
       sig, wav, "RIFF/WAVE，且 fmt 与 data chunk 都存在", "chunk 遍历命中 fmt + data", W_DECISIVE,
     )
   }
   if info.form == "AVI " &&
     (contains_name(info.chunks, "hdrl") || contains_name(info.chunks, "movi")) {
+    if info.truncated {
+      return degraded_detection(
+        sig,
+        avi,
+        "RIFF/AVI，必需 chunk 头存在，但声明长度超过实际数据（文件被截断）",
+        "chunk 头存在，chunk 体缺失",
+      )
+    }
     return structured_detection(
       sig, avi, "RIFF/AVI，且 hdrl 或 movi chunk 存在", "chunk 遍历命中 AVI 必需块", W_DECISIVE,
     )
@@ -288,8 +346,24 @@ fn refine_riff(sig : Signature, data : Bytes) -> Detection {
     (contains_name(info.chunks, "VP8 ") ||
       contains_name(info.chunks, "VP8L") ||
       contains_name(info.chunks, "VP8X")) {
+    if info.truncated {
+      return degraded_detection(
+        sig,
+        webp,
+        "RIFF/WEBP，编码 chunk 头存在，但声明长度超过实际数据（文件被截断）",
+        "chunk 头存在，chunk 体缺失",
+      )
+    }
     return structured_detection(
       sig, webp, "RIFF/WEBP，且存在 VP8/VP8L/VP8X chunk", "chunk 遍历命中 WebP 编码块", W_DECISIVE,
+    )
+  }
+  if info.truncated {
+    return degraded_detection(
+      sig,
+      riff,
+      "RIFF 容器，声明长度超过实际数据（文件被截断）",
+      "chunk 遍历未完成",
     )
   }
   with_candidates(
@@ -304,13 +378,30 @@ fn refine_riff(sig : Signature, data : Bytes) -> Detection {
 ///|
 fn refine_iff(sig : Signature, data : Bytes) -> Detection {
   match parse_iff(data) {
-    Some(info) =>
+    Some(info) => {
       if (info.form == "AIFF" || info.form == "AIFC") &&
         contains_name(info.chunks, "COMM") {
+        if info.truncated {
+          return degraded_detection(
+            sig,
+            aiff,
+            "IFF/AIFF，COMM chunk 头存在，但声明长度超过实际数据（文件被截断）",
+            "chunk 头存在，chunk 体缺失",
+          )
+        }
         return structured_detection(
           sig, aiff, "IFF/AIFF，且存在 COMM chunk", "chunk 遍历命中 COMM", W_DECISIVE,
         )
       }
+      if info.truncated {
+        return degraded_detection(
+          sig,
+          iff,
+          "IFF 容器，声明长度超过实际数据（文件被截断）",
+          "chunk 遍历未完成",
+        )
+      }
+    }
     None => ()
   }
   with_candidates(

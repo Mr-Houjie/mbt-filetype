@@ -17,11 +17,23 @@
 // ---------------------------------------------------------------------------
 
 ///|
+/// 区间判定：`offset` 起 `width` 字节是否完整落在 `length` 内。
+///
+/// 必须写成 `offset <= length - width`，不能写 `offset + width <= length`：
+/// MoonBit 的 `Int` 是 32 位且溢出回绕，当 `offset` 接近 `0x7FFFFFFF`
+/// （例如 PE 的 e_lfanew、ZIP 中央目录的 local header 偏移）时，相加会得到
+/// 负数，把越界判成合法，随后索引即 panic。`length - width` 不会溢出，
+/// 因为 `width <= length` 已先行保证。
+fn in_range(offset : Int, width : Int, length : Int) -> Bool {
+  offset >= 0 && width >= 0 && width <= length && offset <= length - width
+}
+
+///|
 /// 比对 `offset` 处的 `magic`，越界或长度不足返回 `false`。
 fn match_at(data : Bytes, offset : Int, magic : Bytes) -> Bool {
   let n = data.length()
   let m = magic.length()
-  if offset < 0 || m == 0 || offset + m > n {
+  if m == 0 || !in_range(offset, m, n) {
     return false
   }
   let mut i = 0
@@ -45,7 +57,7 @@ fn byte_at(data : Bytes, offset : Int) -> Int? {
 ///|
 /// 读小端 16 位。
 fn u16_le(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 2 > data.length() {
+  if !in_range(offset, 2, data.length()) {
     return None
   }
   Some(data[offset].to_int() + data[offset + 1].to_int() * 256)
@@ -54,7 +66,7 @@ fn u16_le(data : Bytes, offset : Int) -> Int? {
 ///|
 /// 读大端 16 位。
 fn u16_be(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 2 > data.length() {
+  if !in_range(offset, 2, data.length()) {
     return None
   }
   Some(data[offset].to_int() * 256 + data[offset + 1].to_int())
@@ -63,10 +75,10 @@ fn u16_be(data : Bytes, offset : Int) -> Int? {
 ///|
 /// 读小端 32 位。
 ///
-/// 最高字节 ≥ 0x80 时数值超出内存缓冲区的可寻址范围，按越界处理返回 `None`，
-/// 这样所有调用点都不需要再单独防溢出。
+/// 最高字节 ≥ 0x80 时数值超出 `Int`（32 位有符号）的可表示范围，
+/// 任何「文件内偏移」都不可能达到该值，按越界处理返回 `None`。
 fn u32_le(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 4 > data.length() {
+  if !in_range(offset, 4, data.length()) {
     return None
   }
   let high = data[offset + 3].to_int()
@@ -84,7 +96,7 @@ fn u32_le(data : Bytes, offset : Int) -> Int? {
 ///|
 /// 读大端 32 位（同上，超出范围返回 `None`）。
 fn u32_be(data : Bytes, offset : Int) -> Int? {
-  if offset < 0 || offset + 4 > data.length() {
+  if !in_range(offset, 4, data.length()) {
     return None
   }
   let high = data[offset].to_int()
@@ -101,7 +113,7 @@ fn u32_be(data : Bytes, offset : Int) -> Int? {
 
 ///|
 fn slice_bytes(data : Bytes, start : Int, end : Int) -> Bytes? {
-  if start < 0 || end < start || end > data.length() {
+  if end < start || !in_range(start, end - start, data.length()) {
     return None
   }
   let out : Array[Byte] = []
@@ -129,7 +141,7 @@ fn write_code(builder : StringBuilder, code : Int) -> Unit {
 /// 也不能用 `Bytes::to_string`（它返回 `b"..."` 调试形式），
 /// 所以这里显式做 UTF-8 解码。
 fn raw_string(data : Bytes, offset : Int, length : Int) -> String {
-  if offset < 0 || length <= 0 || offset + length > data.length() {
+  if length <= 0 || !in_range(offset, length, data.length()) {
     return ""
   }
   let builder = StringBuilder()
@@ -210,6 +222,11 @@ pub struct ZipArchive {
 }
 
 ///|
+/// 从文件尾部向前找 EOCD。
+///
+/// 优先返回「注释长度与文件末尾严格吻合」的那一条：这样文件里偶然出现的
+/// `PK\x05\x06`（或下载中断留下的残片）不会被当成中央目录入口。
+/// 若没有严格吻合的，再退回最后一次出现的位置（兼容尾部附加数据的自解压包）。
 fn find_eocd(data : Bytes) -> Int? {
   let len = data.length()
   if len < 22 {
@@ -217,13 +234,27 @@ fn find_eocd(data : Bytes) -> Int? {
   }
   let mut pos = len - 22
   let floor = if len > 65557 { len - 65557 } else { 0 }
+  let mut fallback = -1
   while pos >= floor {
     if match_at(data, pos, b"PK\x05\x06") {
-      return Some(pos)
+      let comment_len = match u16_le(data, pos + 20) {
+        Some(v) => v
+        None => 0
+      }
+      if pos + 22 <= len && comment_len == len - pos - 22 {
+        return Some(pos)
+      }
+      if fallback < 0 {
+        fallback = pos
+      }
     }
     pos = pos - 1
   }
-  None
+  if fallback >= 0 {
+    Some(fallback)
+  } else {
+    None
+  }
 }
 
 ///|
@@ -239,11 +270,15 @@ fn zip_data_offset(data : Bytes, local_offset : Int) -> Int? {
     Some(v) => v
     None => return None
   }
-  let start = local_offset + 30 + name_len + extra_len
-  if start > data.length() {
+  // 先确认 30 字节定长头存在，再做加法，避免 local_offset 接近 Int 上限时回绕
+  if !in_range(local_offset, 30, data.length()) {
     return None
   }
-  Some(start)
+  let start = local_offset + 30
+  if !in_range(start, name_len + extra_len, data.length()) {
+    return None
+  }
+  Some(start + name_len + extra_len)
 }
 
 ///|
@@ -261,13 +296,14 @@ pub fn parse_zip(data : Bytes) -> ZipArchive? {
     Some(v) => v
     None => return None
   }
-  if declared == 0 || cd_offset >= data.length() {
+  if declared == 0 || cd_offset >= eocd {
+    // 中央目录必须位于 EOCD 之前，否则说明偏移是伪造的
     return None
   }
   let entries : Array[ZipEntry] = []
   let mut pos = cd_offset
   let mut count = 0
-  while count < declared && count < 100000 {
+  while count < declared && count < 100000 && pos < eocd {
     if !match_at(data, pos, b"PK\x01\x02") {
       break
     }
@@ -301,7 +337,8 @@ pub fn parse_zip(data : Bytes) -> ZipArchive? {
       Some(v) => v
       None => break
     }
-    if pos + 46 + name_len > data.length() {
+    if !in_range(pos, 46, data.length()) ||
+      !in_range(pos + 46, name_len, data.length()) {
       break
     }
     let name = raw_string(data, pos + 46, name_len)
@@ -317,7 +354,11 @@ pub fn parse_zip(data : Bytes) -> ZipArchive? {
       data_offset: start,
       local_offset,
     })
-    pos = pos + 46 + name_len + extra_len + comment_len
+    let next = pos + 46 + name_len + extra_len + comment_len
+    if next <= pos {
+      break
+    }
+    pos = next
     count = count + 1
   }
   if entries.length() == 0 {
@@ -369,9 +410,10 @@ pub fn zip_entry_names(archive : ZipArchive) -> Array[String] {
 // ---------------------------------------------------------------------------
 
 ///|
-fn ole_sector_offset(sector : Int, sector_size : Int) -> Int {
-  // 扇区号 + 1 才是文件偏移（头部占第 0 个扇区的位置）
-  if sector < 0 || sector > 1048576 {
+fn ole_sector_offset(sector : Int, sector_size : Int, length : Int) -> Int {
+  // 扇区号 + 1 才是文件偏移（头部占第 0 个扇区的位置）。
+  // 先做除法约束扇区号，避免 `(sector + 1) * sector_size` 溢出后再被当成小偏移。
+  if sector < 0 || sector_size <= 0 || sector >= length / sector_size {
     return -1
   }
   (sector + 1) * sector_size
@@ -439,7 +481,7 @@ pub fn parse_ole2_streams(data : Bytes) -> Array[String]? {
   }
   let fat : Array[Int] = []
   for sector in fat_sectors {
-    let base = ole_sector_offset(sector, sector_size)
+    let base = ole_sector_offset(sector, sector_size, data.length())
     if base >= 0 && base + sector_size <= data.length() {
       let mut j = 0
       while j < sector_size {
@@ -458,7 +500,7 @@ pub fn parse_ole2_streams(data : Bytes) -> Array[String]? {
   let mut sector = dir_start
   let mut steps = 0
   while sector >= 0 && steps < 4096 {
-    let base = ole_sector_offset(sector, sector_size)
+    let base = ole_sector_offset(sector, sector_size, data.length())
     if base < 0 || base + sector_size > data.length() {
       break
     }
@@ -526,19 +568,19 @@ fn read_box(data : Bytes, pos : Int, limit : Int) -> BmffBox? {
     if high != 0 || low < 16 {
       return None
     }
-    let end = pos + low
-    if end > limit {
+    if low > limit - pos {
       return None
     }
+    let end = pos + low
     return Some({ typ, payload: pos + 16, end })
   }
   if size32 < 8 {
     return None
   }
-  let end = pos + size32
-  if end > limit {
+  if size32 > limit - pos {
     return None
   }
+  let end = pos + size32
   Some({ typ, payload: pos + 8, end })
 }
 
@@ -643,33 +685,58 @@ pub struct RiffInfo {
   chunks : Array[String]
   /// chunk 遍历是否走到预期结尾
   complete : Bool
+  /// 声明的容器长度（或最后一个 chunk）超出实际数据，即文件被截断
+  truncated : Bool
 }
 
 ///|
-fn parse_chunk_container(data : Bytes, tag : Bytes) -> RiffInfo? {
-  if data.length() < 12 || !match_at(data, 0, tag) {
+fn read_u32_in(data : Bytes, offset : Int, big_endian : Bool) -> Int? {
+  if big_endian {
+    u32_be(data, offset)
+  } else {
+    u32_le(data, offset)
+  }
+}
+
+///|
+/// 遍历 RIFF/IFF 的 chunk 链。
+///
+/// RIFF（WAVE/AVI/WEBP）的长度字段是小端，IFF（AIFF/AIFC）是大端，
+/// 两者的 chunk 布局其余部分相同，所以用 `big_endian` 参数区分，
+/// 不能一律按小端读——否则 IFF 的长度会被读成天文数字，chunk 遍历立刻中断。
+fn parse_chunk_container(
+  data : Bytes,
+  tag : Bytes,
+  big_endian : Bool,
+) -> RiffInfo? {
+  let len = data.length()
+  if len < 12 || !match_at(data, 0, tag) {
     return None
   }
-  let declared = match u32_le(data, 4) {
+  let declared = match read_u32_in(data, 4, big_endian) {
     Some(v) => v
     None => return None
   }
   let form = raw_string(data, 8, 4)
-  let limit = if 8 + declared < data.length() {
-    8 + declared
-  } else {
-    data.length()
-  }
+  // 声明长度以「文件长度 - 8」为上限，超出就说明文件被截断。
+  // 这里用减法而不是 `8 + declared`，避免 declared 接近 Int 上限时回绕。
+  let mut truncated = declared > len - 8
+  let limit = if truncated { len } else { 8 + declared }
   let chunks : Array[String] = []
   let mut pos = 12
   let mut scanned = 0
   while pos + 8 <= limit && scanned < 4096 {
     let id = raw_string(data, pos, 4)
-    let size = match u32_le(data, pos + 4) {
+    let size = match read_u32_in(data, pos + 4, big_endian) {
       Some(v) => v
       None => break
     }
     chunks.push(id)
+    // chunk 体必须完整落在容器内，否则记为截断并停止
+    if size > limit - pos - 8 {
+      truncated = true
+      break
+    }
     let advance = 8 + size + (size % 2)
     if advance <= 8 {
       break
@@ -680,19 +747,20 @@ fn parse_chunk_container(data : Bytes, tag : Bytes) -> RiffInfo? {
   Some({
     form,
     chunks,
-    complete: chunks.length() > 0 && pos >= limit - 1,
+    complete: !truncated && pos >= limit - 1,
+    truncated,
   })
 }
 
 ///|
 pub fn parse_riff(data : Bytes) -> RiffInfo? {
-  parse_chunk_container(data, b"RIFF")
+  parse_chunk_container(data, b"RIFF", false)
 }
 
 ///|
-/// IFF（AIFF/AIFC 等）用的是 `FORM` 容器标记，chunk 布局与 RIFF 相同。
+/// IFF（AIFF/AIFC 等）用的是 `FORM` 容器标记，且所有长度字段都是大端。
 pub fn parse_iff(data : Bytes) -> RiffInfo? {
-  parse_chunk_container(data, b"FORM")
+  parse_chunk_container(data, b"FORM", true)
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +837,7 @@ pub fn ebml_doctype(data : Bytes) -> String? {
     None => return None
   }
   let mut pos = element_id_len + header_size_len
-  let end = if pos + header_size < limit { pos + header_size } else { limit }
+  let end = if header_size < limit - pos { pos + header_size } else { limit }
   let mut scanned = 0
   while pos < end && scanned < 256 {
     let (id_value, element_id_len) = match read_vint(data, pos, end) {
@@ -783,7 +851,7 @@ pub fn ebml_doctype(data : Bytes) -> String? {
     }
     let payload_len = vint_payload(size_value, size_len)
     let payload = size_pos + size_len
-    if payload + payload_len > end {
+    if payload > end || payload_len > end - payload {
       break
     }
     if id_value == 0x4282 {

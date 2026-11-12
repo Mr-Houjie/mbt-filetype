@@ -139,3 +139,260 @@ test "任意字节输入不 panic（固定种子 fuzz）" {
     round = round + 1
   }
 }
+
+// ---------------------------------------------------------------------------
+// 回归测试：验收反馈里的整数溢出、IFF 大端与截断判定
+// ---------------------------------------------------------------------------
+
+///|
+fn push_u8(out : Array[Byte], value : Int) -> Unit {
+  out.push((value & 0xff).to_byte())
+}
+
+///|
+fn push_u16_le(out : Array[Byte], value : Int) -> Unit {
+  push_u8(out, value & 0xff)
+  push_u8(out, (value >> 8) & 0xff)
+}
+
+///|
+fn push_u32_le(out : Array[Byte], value : Int) -> Unit {
+  push_u8(out, value & 0xff)
+  push_u8(out, (value >> 8) & 0xff)
+  push_u8(out, (value >> 16) & 0xff)
+  push_u8(out, (value >> 24) & 0xff)
+}
+
+///|
+fn push_u32_be(out : Array[Byte], value : Int) -> Unit {
+  push_u8(out, (value >> 24) & 0xff)
+  push_u8(out, (value >> 16) & 0xff)
+  push_u8(out, (value >> 8) & 0xff)
+  push_u8(out, value & 0xff)
+}
+
+///|
+fn push_all(out : Array[Byte], data : Bytes) -> Unit {
+  let mut i = 0
+  while i < data.length() {
+    out.push(data[i])
+    i = i + 1
+  }
+}
+
+///|
+fn as_bytes(out : Array[Byte]) -> Bytes {
+  Bytes::from_array(out.exact_view())
+}
+
+///|
+/// ASCII 字符串转字节。不能用 `String::to_bytes()`——它按 UTF-16LE 编码。
+fn ascii_bytes(s : String) -> Bytes {
+  let out : Array[Byte] = []
+  for c in s {
+    out.push(c.to_int().to_byte())
+  }
+  as_bytes(out)
+}
+
+///|
+/// 构造 64 字节的 MZ 文件，`e_lfanew` 由参数指定。
+fn mz_with_lfanew(value : Int) -> Bytes {
+  let out : Array[Byte] = []
+  for i = 0; i < 64; i = i + 1 {
+    out.push(b'\x00')
+  }
+  out[0] = b'M'
+  out[1] = b'Z'
+  push_u32_le_at(out, 60, value)
+  as_bytes(out)
+}
+
+///|
+fn push_u32_le_at(out : Array[Byte], offset : Int, value : Int) -> Unit {
+  out[offset] = (value & 0xff).to_byte()
+  out[offset + 1] = ((value >> 8) & 0xff).to_byte()
+  out[offset + 2] = ((value >> 16) & 0xff).to_byte()
+  out[offset + 3] = ((value >> 24) & 0xff).to_byte()
+}
+
+///|
+/// 构造单条目 stored ZIP；`local_offset` 可注入非法值，`declared` 可虚报条目数。
+fn stored_zip(
+  name : String,
+  content : String,
+  local_offset : Int,
+  declared : Int,
+) -> Bytes {
+  let out : Array[Byte] = []
+  let name_bytes = ascii_bytes(name)
+  let content_bytes = ascii_bytes(content)
+  // 本地文件头
+  push_all(out, b"PK\x03\x04")
+  push_u16_le(out, 20)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u32_le(out, 0)
+  push_u32_le(out, content_bytes.length())
+  push_u32_le(out, content_bytes.length())
+  push_u16_le(out, name_bytes.length())
+  push_u16_le(out, 0)
+  push_all(out, name_bytes)
+  push_all(out, content_bytes)
+  // 中央目录
+  let cd_offset = out.length()
+  push_all(out, b"PK\x01\x02")
+  push_u16_le(out, 20)
+  push_u16_le(out, 20)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u32_le(out, 0)
+  push_u32_le(out, content_bytes.length())
+  push_u32_le(out, content_bytes.length())
+  push_u16_le(out, name_bytes.length())
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u32_le(out, 0)
+  push_u32_le(out, local_offset)
+  push_all(out, name_bytes)
+  let cd_size = out.length() - cd_offset
+  // EOCD
+  push_all(out, b"PK\x05\x06")
+  push_u16_le(out, 0)
+  push_u16_le(out, 0)
+  push_u16_le(out, declared)
+  push_u16_le(out, declared)
+  push_u32_le(out, cd_size)
+  push_u32_le(out, cd_offset)
+  push_u16_le(out, 0)
+  as_bytes(out)
+}
+
+///|
+test "回归：e_lfanew 极大值不得 panic，也不得误报为合法 PE" {
+  let values = [
+    0x7ffffffc, 0x7ffffffd, 0x7ffffffe, 0x7fffffff, 0x80000000, 0xffffffff,
+  ]
+  for value in values {
+    let detection = @Mr-Houjie/mbt-filetype.detect(mz_with_lfanew(value))
+    match detection.file_type {
+      Some(file_type) => assert_eq(file_type.id, "pe")
+      None => assert_true(false)
+    }
+    assert_eq(
+      @Mr-Houjie/mbt-filetype.confidence_name(detection.confidence),
+      "probable",
+    )
+  }
+}
+
+///|
+test "回归：ZIP 中央目录里的巨大 local header 偏移不得 panic" {
+  let detection = @Mr-Houjie/mbt-filetype.detect(
+    stored_zip("mimetype", "application/epub+zip", 0x7fffffff, 1),
+  )
+  match detection.file_type {
+    Some(file_type) => assert_eq(file_type.id, "zip")
+    None => assert_true(false)
+  }
+  assert_eq(
+    @Mr-Houjie/mbt-filetype.confidence_name(detection.confidence),
+    "probable",
+  )
+}
+
+///|
+test "回归：合法 ZIP 仍判定为 EPUB 且为 certain" {
+  let detection = @Mr-Houjie/mbt-filetype.detect(
+    stored_zip("mimetype", "application/epub+zip", 0, 1),
+  )
+  match detection.file_type {
+    Some(file_type) => assert_eq(file_type.id, "epub")
+    None => assert_true(false)
+  }
+  assert_eq(
+    @Mr-Houjie/mbt-filetype.confidence_name(detection.confidence),
+    "certain",
+  )
+}
+
+///|
+test "回归：EOCD 虚报条目数时降级并说明只解析出几条" {
+  let detection = @Mr-Houjie/mbt-filetype.detect(
+    stored_zip("mimetype", "application/epub+zip", 0, 2),
+  )
+  match detection.file_type {
+    Some(file_type) => assert_eq(file_type.id, "epub")
+    None => assert_true(false)
+  }
+  assert_eq(
+    @Mr-Houjie/mbt-filetype.confidence_name(detection.confidence),
+    "probable",
+  )
+  assert_true(detection.reason.contains("1/2"))
+}
+
+///|
+/// 构造 AIFC：`FVER` 在 `COMM` 之前，长度字段全部大端。
+fn aifc_with_fver_first() -> Bytes {
+  let out : Array[Byte] = []
+  push_all(out, b"FORM")
+  push_u32_be(out, 42)
+  push_all(out, b"AIFC")
+  push_all(out, b"FVER")
+  push_u32_be(out, 4)
+  push_u32_be(out, 0xa2805140)
+  push_all(out, b"COMM")
+  push_u32_be(out, 18)
+  push_u16_le(out, 1)
+  push_u32_be(out, 44100)
+  push_u16_le(out, 16)
+  for i = 0; i < 10; i = i + 1 {
+    out.push(b'\x00')
+  }
+  as_bytes(out)
+}
+
+///|
+test "回归：IFF 必须按大端解析，FVER 在前的 AIFC 仍识别为 aiff" {
+  let detection = @Mr-Houjie/mbt-filetype.detect(aifc_with_fver_first())
+  match detection.file_type {
+    Some(file_type) => assert_eq(file_type.id, "aiff")
+    None => assert_true(false)
+  }
+  assert_eq(
+    @Mr-Houjie/mbt-filetype.confidence_name(detection.confidence),
+    "certain",
+  )
+}
+
+///|
+test "回归：截断的 RIFF 必须降级并说明截断，而不是宣称结构完整" {
+  let out : Array[Byte] = []
+  push_all(out, b"RIFF")
+  push_u32_le(out, 1000)
+  push_all(out, b"WAVE")
+  push_all(out, b"fmt ")
+  push_u32_le(out, 16)
+  for i = 0; i < 16; i = i + 1 {
+    out.push(b'\x00')
+  }
+  push_all(out, b"data")
+  push_u32_le(out, 0x00010000)
+  let detection = @Mr-Houjie/mbt-filetype.detect(as_bytes(out))
+  match detection.file_type {
+    Some(file_type) => assert_eq(file_type.id, "wav")
+    None => assert_true(false)
+  }
+  assert_eq(
+    @Mr-Houjie/mbt-filetype.confidence_name(detection.confidence),
+    "probable",
+  )
+  assert_true(detection.reason.contains("截断"))
+}
